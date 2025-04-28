@@ -1,0 +1,249 @@
+Customer Eligibility Rule Flip Monitoring & Predictive Analytics
+🌎 Executive Summary
+Modern eligibility systems require not just evaluation, but continuous integrity monitoring.
+Rule flips can signal individual customer eligibility changes or broader systemic data issues.
+Our platform captures, analyzes, and predicts rule flips, ensuring proactive action and business continuity.
+
+📊 Why Flip Monitoring Matters
+Prevent Revenue Loss: Early detection of eligibility errors saves revenue.
+Data Quality Assurance: Identify systemic data corruption before impact.
+Customer Trust: Maintain consistency in eligibility decisions.
+Regulatory Compliance: Transparent and auditable decision-making trails.
+
+📊 Core Capabilities
+✅ Flip Detection
+Detects every flip at a customer + rule level.
+Captures complete evaluation context ("why it flipped").
+✅ Flip Series Pattern Recognition
+Aggregates flips across time and rules.
+Flags abnormal patterns indicative of systemic issues.
+✅ Real-Time Alerts
+Instant alerting for high-severity or mass flips.
+Integration with Slack, Email, PagerDuty.
+✅ Predictive Analytics
+Forecasts potential future flips using machine learning.
+Identifies rules at risk for instability.
+✅ Dashboards & Visualization
+Grafana and Superset dashboards.
+Real-time flip trend visualization and drill-downs.
+✅ Root Cause Analysis Automation
+Auto-correlates flips to data changes, rule modifications, or external feeds.
+✅ Data Quality Integration
+Links flips with upstream data quality checks.
+Auto-flagging of suspicious incoming data.
+
+🏛️ Technical Architecture Overview
+Event-Driven Processing: Kafka/Redpanda.
+Data Store: PostgreSQL with flip and analysis tables.
+Rule Engine Enhancement: Flip reason capture.
+Analytics Layer: Python ML models for prediction and anomaly detection.
+Visualization: Grafana, Metabase.
+Alerting Layer: Webhooks, PagerDuty, Email integration.
+
+🚀 Business Impact
+Metric
+Before
+After (with System)
+Issue Detection Latency
+7-14 days
+Real-time (<1 hour)
+Revenue Loss Due to Errors
+$500k+/year
+<$50k/year
+Customer Trust Metrics
+Neutral/Declining
+Improving
+Compliance/Audit Effort
+High (manual investigation)
+Low (automated trail available)
+
+
+🌈 Future Vision
+Autonomous Eligibility Systems: Self-correct minor data errors.
+Full RCA Generation: End-to-end, human-readable root cause reports.
+Business Impact Prediction: Direct estimation of revenue loss if flips not fixed.
+
+🌟 Conclusion
+Investing in proactive flip monitoring transforms eligibility from a "reactive operation" to a "strategic business safeguard," improving trust, compliance, and bottom-line revenue.
+
+🔍 Q&A
+Let's discuss how this system can be tailored to your organization's needs!
+
+
+import sqlite3
+import json
+import uuid
+from datetime import datetime
+
+# Simulated queue input
+evaluation_queue = [
+    {
+        "customerId": "CUST001",
+        "ruleId": "RULE123",
+        "result": "Eligible",
+        "evaluationContext": {
+            "conditions": [
+                {
+                    "expression": "creditScore >= 700",
+                    "evaluatedValue": 710,
+                    "result": True
+                }
+            ]
+        }
+    },
+    {
+        "customerId": "CUST001",
+        "ruleId": "RULE123",
+        "result": "Ineligible",
+        "evaluationContext": {
+            "conditions": [
+                {
+                    "expression": "creditScore >= 700",
+                    "evaluatedValue": 680,
+                    "result": False
+                }
+            ]
+        }
+    },
+    {
+        "customerId": "CUST002",
+        "ruleId": "RULE123",
+        "result": "Ineligible",
+        "evaluationContext": {
+            "conditions": [
+                {
+                    "expression": "creditScore >= 700",
+                    "evaluatedValue": 600,
+                    "result": False
+                }
+            ]
+        }
+    }
+]
+
+# --- Database Setup ---
+def initialize_db():
+    conn = sqlite3.connect('rule_flips.db')
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id TEXT,
+            rule_id TEXT,
+            result TEXT,
+            evaluation_context TEXT,
+            timestamp TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS flips (
+            flip_id TEXT PRIMARY KEY,
+            customer_id TEXT,
+            rule_id TEXT,
+            previous_result TEXT,
+            new_result TEXT,
+            evaluation_context TEXT,
+            timestamp TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS flip_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id TEXT,
+            date TEXT,
+            flip_count INTEGER,
+            UNIQUE(rule_id, date)
+        )
+    ''')
+    conn.commit()
+    return conn
+
+# --- Flip Logic ---
+def store_evaluation(conn, evaluation):
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO evaluations (customer_id, rule_id, result, evaluation_context, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (
+        evaluation['customerId'],
+        evaluation['ruleId'],
+        evaluation['result'],
+        json.dumps(evaluation['evaluationContext']),
+        datetime.utcnow().isoformat()
+    ))
+    conn.commit()
+
+def update_flip_analysis(conn, rule_id):
+    cursor = conn.cursor()
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    cursor.execute('''
+        INSERT INTO flip_analysis (rule_id, date, flip_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(rule_id, date) DO UPDATE SET flip_count = flip_count + 1
+    ''', (rule_id, date_str))
+    conn.commit()
+
+def detect_abnormal_flips(conn, threshold=2):
+    cursor = conn.cursor()
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    cursor.execute('''
+        SELECT rule_id, flip_count FROM flip_analysis
+        WHERE date = ? AND flip_count >= ?
+    ''', (today, threshold))
+    results = cursor.fetchall()
+    if results:
+        print("\n⚠️ Abnormal Flip Pattern Detected:")
+        for rule_id, count in results:
+            print(f" - Rule {rule_id} flipped {count} times today.\n")
+
+def check_and_store_flip(conn, evaluation):
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT result FROM evaluations
+        WHERE customer_id = ? AND rule_id = ?
+        ORDER BY timestamp DESC LIMIT 1
+    ''', (evaluation['customerId'], evaluation['ruleId']))
+    
+    row = cursor.fetchone()
+    new_result = evaluation['result']
+
+    if row:
+        previous_result = row[0]
+        if new_result != previous_result:
+            flip_id = str(uuid.uuid4())
+            cursor.execute('''
+                INSERT INTO flips (flip_id, customer_id, rule_id, previous_result, new_result, evaluation_context, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                flip_id,
+                evaluation['customerId'],
+                evaluation['ruleId'],
+                previous_result,
+                new_result,
+                json.dumps(evaluation['evaluationContext']),
+                datetime.utcnow().isoformat()
+            ))
+            conn.commit()
+            update_flip_analysis(conn, evaluation['ruleId'])
+            print(f"\n🚨 Flip detected for {evaluation['customerId']}:")
+            print(f"Rule: {evaluation['ruleId']} | {previous_result} → {new_result}")
+            print(f"Reason:\n{json.dumps(evaluation['evaluationContext'], indent=2)}\n")
+
+# --- Main Processor ---
+def process_queue():
+    conn = initialize_db()
+    for evaluation in evaluation_queue:
+        check_and_store_flip(conn, evaluation)
+        store_evaluation(conn, evaluation)
+    detect_abnormal_flips(conn)
+    conn.close()
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    process_queue()
+
+
+
