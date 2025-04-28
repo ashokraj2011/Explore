@@ -1,0 +1,378 @@
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.node.*;
+import com.fasterxml.jackson.core.type.TypeReference;
+import java.io.*;
+import java.util.*;
+import java.util.stream.*;
+
+public class DataTransformationDriver {
+    public static void main(String[] args) throws Exception {
+        if (args.length != 1) {
+            System.err.println("Usage: java DataTransformationDriver <spec-file>");
+            System.exit(1);
+        }
+        String specPath = args[0];
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode spec = mapper.readTree(new File(specPath));
+
+        // 1. Load dataSources (files or inline JsonNode arrays)
+        Map<String, List<JsonNode>> dataSets = new HashMap<>();
+        JsonNode dataSources = spec.get("dataSources");
+        for (Iterator<String> it = dataSources.fieldNames(); it.hasNext();) {
+            String name = it.next();
+            JsonNode src = dataSources.get(name);
+            String type = src.get("type").asText();
+            List<JsonNode> list = new ArrayList<>();
+            switch (type) {
+                case "file":
+                    String format = src.get("format").asText();
+                    String path = src.get("path").asText();
+                    if ("jsonl".equals(format)) {
+                        try (BufferedReader reader = new BufferedReader(new FileReader(path))) {
+                            String line;
+                            while ((line = reader.readLine()) != null) {
+                                list.add(mapper.readTree(line));
+                            }
+                        }
+                    } else if ("json".equals(format)) {
+                        list = mapper.readValue(new File(path), new TypeReference<List<JsonNode>>() {});
+                    }
+                    break;
+                case "inline":
+                case "jsonNode":
+                    JsonNode dataArray = src.get("data");
+                    if (dataArray != null && dataArray.isArray()) {
+                        for (JsonNode elem : dataArray) {
+                            list.add(elem);
+                        }
+                    } else {
+                        throw new IllegalArgumentException("Inline data must be an array for dataSource: " + name);
+                    }
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported dataSource type: " + type);
+            }
+            dataSets.put(name, list);
+        }
+
+        // 2. Process transformation steps
+        for (JsonNode step : spec.get("steps")) {
+            String op = step.get("op").asText();
+            String outputAs = step.get("outputAs").asText();
+            List<JsonNode> result;
+            switch (op) {
+                case "join":
+                    result = performJoin(step, dataSets, mapper);
+                    break;
+                case "filter":
+                    result = performFilter(step, dataSets);
+                    break;
+                case "aggregate":
+                    result = performAggregate(step, dataSets, mapper);
+                    break;
+                case "map": case "project":
+                    result = performMap(step, dataSets, mapper);
+                    break;
+                default:
+                    throw new UnsupportedOperationException("Unknown op: " + op);
+            }
+            dataSets.put(outputAs, result);
+        }
+
+        // 3. Output final result
+        JsonNode lastStep = spec.get("steps").get(spec.get("steps").size() - 1);
+        String finalOutput = lastStep.get("outputAs").asText();
+        mapper.writerWithDefaultPrettyPrinter()
+              .writeValue(System.out, dataSets.get(finalOutput));
+    }
+
+    // == JOIN ===
+    private static List<JsonNode> performJoin(JsonNode step,
+                                              Map<String,List<JsonNode>> dataSets,
+                                              ObjectMapper mapper) {
+        String leftSource  = step.get("leftSource").asText();
+        String rightSource = step.get("rightSource").asText();
+        String leftKey     = step.get("leftKey").asText();
+        String rightKey    = step.get("rightKey").asText();
+        String joinType    = step.get("joinType").asText();
+
+        List<JsonNode> left  = dataSets.get(leftSource);
+        List<JsonNode> right = dataSets.get(rightSource);
+
+        Map<String,JsonNode> index = new HashMap<>();
+        for (JsonNode r : right) {
+            JsonNode k = r.at(rightKey);
+            if (!k.isMissingNode()) index.put(k.asText(), r);
+        }
+
+        List<JsonNode> out = new ArrayList<>();
+        for (JsonNode l : left) {
+            JsonNode k = l.at(leftKey);
+            JsonNode match = index.get(k.asText());
+            if (match != null) {
+                ObjectNode comb = mapper.createObjectNode();
+                comb.setAll((ObjectNode)l);
+                comb.set("joined", match);
+                out.add(comb);
+            } else if ("left".equalsIgnoreCase(joinType)
+                    || "full".equalsIgnoreCase(joinType)) {
+                ObjectNode comb = mapper.createObjectNode();
+                comb.setAll((ObjectNode)l);
+                comb.set("joined", mapper.createObjectNode());
+                out.add(comb);
+            }
+        }
+        return out;
+    }
+
+    // == FILTER ===
+    private static List<JsonNode> performFilter(JsonNode step,
+                                                 Map<String,List<JsonNode>> dataSets) {
+        String source = step.get("source").asText();
+        JsonNode cond = step.get("condition");
+        return dataSets.get(source).stream()
+                      .filter(n -> evaluateCondition(n, cond))
+                      .collect(Collectors.toList());
+    }
+
+    private static boolean evaluateCondition(JsonNode n, JsonNode c) {
+        if (c.has("all")) {
+            for (JsonNode sub : c.get("all")) if (!evaluateCondition(n, sub)) return false;
+            return true;
+        }
+        if (c.has("any")) {
+            for (JsonNode sub : c.get("any")) if (evaluateCondition(n, sub)) return true;
+            return false;
+        }
+        if (c.has("not")) {
+            return !evaluateCondition(n, c.get("not"));
+        }
+        String path = c.get("path").asText();
+        JsonNode f   = n.at(path);
+        if (f.isMissingNode() || f.isNull()) return false;
+        if (c.has("gt")) return f.asDouble() > c.get("gt").asDouble();
+        if (c.has("eq")) return f.asText().equals(c.get("eq").asText());
+        return false;
+    }
+
+    // == AGGREGATE ===
+    private static List<JsonNode> performAggregate(JsonNode step,
+                                                   Map<String,List<JsonNode>> dataSets,
+                                                   ObjectMapper mapper) {
+        String source = step.get("source").asText();
+        List<JsonNode> rows = dataSets.get(source);
+        List<String> groupBy = new ArrayList<>();
+        for (JsonNode p : step.get("groupBy")) groupBy.add(p.asText());
+        List<AggregationDef> defs = new ArrayList<>();
+        for (JsonNode a : step.get("aggregations")) {
+            defs.add(new AggregationDef(a.get("field").asText(), a.get("func").asText(), a.get("target").asText()));
+        }
+        Map<String, AggregationHolder> groups = new LinkedHashMap<>();
+        for (JsonNode r : rows) {
+            List<String> keys = groupBy.stream().map(p -> r.at(p).asText()).collect(Collectors.toList());
+            String mapKey = String.join("|", keys);
+            AggregationHolder holder = groups.computeIfAbsent(mapKey, k -> new AggregationHolder(keys, defs));
+            holder.accumulate(r);
+        }
+        List<JsonNode> out = new ArrayList<>();
+        for (AggregationHolder h : groups.values()) {
+            ObjectNode obj = mapper.createObjectNode();
+            ArrayNode keyArr = mapper.createArrayNode();
+            h.keyValues.forEach(keyArr::add);
+            obj.set("key", keyArr);
+            for (AggregationDef d : defs) setValueAtPath(obj, d.target, h.getResult(d), mapper);
+            out.add(obj);
+        }
+        return out;
+    }
+
+    private static class AggregationDef { String fieldPath, func, target; AggregationDef(String f, String fn, String t) { this.fieldPath=f; this.func=fn; this.target=t; }}
+    private static class AggregationHolder {
+        List<String> keyValues; Map<String,Double> sumMap; Map<String,Long> countMap; List<AggregationDef> defs;
+        AggregationHolder(List<String> keys, List<AggregationDef> defs) {
+            this.keyValues=keys; this.defs=defs; this.sumMap=new HashMap<>(); this.countMap=new HashMap<>();
+            for (AggregationDef d : defs) { sumMap.put(d.target,0.0); countMap.put(d.target,0L); }
+        }
+        void accumulate(JsonNode r) { for (AggregationDef d : defs) {
+            switch (d.func.toLowerCase()) {
+                case "sum":   sumMap.put(d.target, sumMap.get(d.target)+r.at(d.fieldPath).asDouble()); break;
+                case "count": countMap.put(d.target, countMap.get(d.target)+1); break;
+            }
+        }}
+        JsonNode getResult(AggregationDef d) {
+            switch (d.func.toLowerCase()) {
+                case "sum":   return DoubleNode.valueOf(sumMap.get(d.target));
+                case "count": return LongNode.valueOf(countMap.get(d.target));
+                default:       return NullNode.instance;
+            }
+        }
+    }
+
+    // == MAP / PROJECT ===
+    private static List<JsonNode> performMap(JsonNode step,
+                                             Map<String,List<JsonNode>> dataSets,
+                                             ObjectMapper mapper) {
+        String source=step.get("source").asText(); List<JsonNode> rows=dataSets.get(source);
+        List<MapField> fields=new ArrayList<>();
+        for(JsonNode f:step.get("fields")) fields.add(new MapField(f.get("target").asText(), f.has("from")?f.get("from").asText():null));
+        List<JsonNode> out=new ArrayList<>();
+        for(JsonNode r:rows){ ObjectNode o=mapper.createObjectNode(); for(MapField mf:fields){ if(mf.from!=null){ JsonNode val=r.at(mf.from); setValueAtPath(o, mf.target, val, mapper); }} out.add(o);} return out;
+    }
+    private static class MapField{ String target,from; MapField(String t,String f){this.target=t;this.from=f;} }
+
+    private static void setValueAtPath(ObjectNode node, String path, JsonNode value, ObjectMapper mapper) {
+        String[] parts = path.startsWith("/") ? path.substring(1).split("/") : path.split("/");
+        ObjectNode curr = node;
+        for (int i = 0; i < parts.length - 1; i++) {
+            JsonNode child = curr.get(parts[i]);
+            if (!(child instanceof ObjectNode)) {
+                ObjectNode next = mapper.createObjectNode();
+                curr.set(parts[i], next);
+                curr = next;
+            } else curr = (ObjectNode) child;
+        }
+        curr.set(parts[parts.length - 1], value);
+    }
+}
+
+
+{
+  "version": "1.0",
+  "dataSources": {
+    "orders": {
+      "type": "file",
+      "format": "jsonl",
+      "path": "data/orders.jsonl"
+    },
+    "customers": {
+      "type": "file",
+      "format": "json",
+      "path": "data/customers.json"
+    }
+  },
+  "steps": [
+    {
+      "op": "join",
+      "leftSource":  "orders",
+      "rightSource": "customers",
+      "leftKey":     "/customerId",
+      "rightKey":    "/id",
+      "joinType":    "inner",
+      "outputAs":    "enrichedOrders"
+    },
+    {
+      "op": "filter",
+      "source":   "enrichedOrders",
+      "condition": {
+        "all": [
+          { "path": "/amount", "gt": 100 },
+          { "path": "/status", "eq": "PAID" }
+        ]
+      },
+      "outputAs": "filteredOrders"
+    },
+    {
+      "op": "aggregate",
+      "source":  "filteredOrders",
+      "groupBy": [ "/customerId", "/customer.region" ],
+      "aggregations": [
+        {
+          "field":  "/amount",
+          "func":   "sum",
+          "target": "/totals.totalSpent"
+        },
+        {
+          "field":  "/amount",
+          "func":   "count",
+          "target": "/totals.orderCount"
+        }
+      ],
+      "outputAs": "customerStats"
+    },
+    {
+      "op":    "map",
+      "source": "customerStats",
+      "fields": [
+        { "target": "/customerId",  "from": "/key[0]" },
+        { "target": "/region",      "from": "/key[1]" },
+        { "target": "/totalSpent",  "from": "/totals.totalSpent" },
+        { "target": "/orderCount",  "from": "/totals.orderCount" }
+      ],
+      "outputAs": "report"
+    }
+  ]
+}
+----
+
+{
+  "version": "1.0",
+  "dataSources": {
+    "orders": {
+      "type": "inline",
+      "data": [
+        { "orderId": 1, "customerId": "C1", "amount": 150, "status": "PAID" },
+        { "orderId": 2, "customerId": "C2", "amount":  80, "status": "PENDING" },
+        { "orderId": 3, "customerId": "C1", "amount": 200, "status": "PAID" }
+      ]
+    },
+    "customers": {
+      "type": "inline",
+      "data": [
+        { "id": "C1", "firstName": "Alice",   "region": "North" },
+        { "id": "C2", "firstName": "Bob",     "region": "South" },
+        { "id": "C3", "firstName": "Charlie", "region": "East"  }
+      ]
+    }
+  },
+  "steps": [
+    {
+      "op": "join",
+      "leftSource":  "orders",
+      "rightSource": "customers",
+      "leftKey":     "/customerId",
+      "rightKey":    "/id",
+      "joinType":    "inner",
+      "outputAs":    "enrichedOrders"
+    },
+    {
+      "op": "filter",
+      "source":   "enrichedOrders",
+      "condition": {
+        "all": [
+          { "path": "/amount", "gt": 100 },
+          { "path": "/status", "eq": "PAID" }
+        ]
+      },
+      "outputAs": "filteredOrders"
+    },
+    {
+      "op": "aggregate",
+      "source":  "filteredOrders",
+      "groupBy": [ "/customerId", "/joined/region" ],
+      "aggregations": [
+        {
+          "field":  "/amount",
+          "func":   "sum",
+          "target": "/totals.totalSpent"
+        },
+        {
+          "field":  "/amount",
+          "func":   "count",
+          "target": "/totals.orderCount"
+        }
+      ],
+      "outputAs": "customerStats"
+    },
+    {
+      "op":    "map",
+      "source": "customerStats",
+      "fields": [
+        { "target": "/customerId",  "from": "/key[0]" },
+        { "target": "/region",      "from": "/key[1]" },
+        { "target": "/totalSpent",  "from": "/totals.totalSpent" },
+        { "target": "/orderCount",  "from": "/totals.orderCount" }
+      ],
+      "outputAs": "report"
+    }
+  ]
+}
